@@ -104,3 +104,56 @@ fn rejects_output_equal_to_input() {
         .unwrap_err();
     assert!(matches!(err, cutframe_core::Error::OutputIsInput));
 }
+
+fn decode_all(req: &cutframe_core::PreviewRequest) -> Vec<cutframe_core::Frame> {
+    let mut src = FfmpegCli::locate().open_preview(req).unwrap();
+    let mut frames = Vec::new();
+    while let Some(f) = src.next_frame().unwrap() {
+        frames.push(f);
+    }
+    frames
+}
+
+#[test]
+fn preview_streams_scaled_frames() {
+    let Some(dir) = workdir("preview") else { return };
+    let video = dir.join("in.mp4");
+    make_video(&video);
+
+    let mut req = cutframe_core::PreviewRequest::new(video);
+    req.max_width = 160;
+    req.fps = 10.0;
+    let frames = decode_all(&req);
+    assert!((29..=31).contains(&frames.len()), "got {} frames", frames.len());
+    let f = &frames[0];
+    assert_eq!((f.width, f.height), (160, 120));
+    assert_eq!(f.rgb.len(), 160 * 120 * 3);
+    assert_eq!(frames[10].pts, std::time::Duration::from_secs(1));
+}
+
+#[test]
+fn preview_after_seek_draws_subtitles() {
+    let Some(dir) = workdir("preview-subs") else { return };
+    let (video, subs) = (dir.join("in.mp4"), dir.join("subs.srt"));
+    make_video(&video);
+    std::fs::write(&subs, SRT).unwrap();
+
+    // 2.0s is inside the second cue (1.6–2.8s); seeking must keep timing right.
+    let mut req = cutframe_core::PreviewRequest::new(video);
+    req.start = std::time::Duration::from_secs(2);
+    req.single_frame = true;
+    let plain = decode_all(&req);
+    req.subtitle = Some(subs);
+    let subbed = decode_all(&req);
+
+    assert_eq!((plain.len(), subbed.len()), (1, 1));
+    let changed = plain[0].rgb.iter().zip(&subbed[0].rgb).filter(|(a, b)| a != b).count();
+    assert!(changed > 500, "subtitles not visible ({changed} bytes differ)");
+
+    // 1.55s falls in the gap between cues, so nothing should be drawn.
+    req.start = std::time::Duration::from_millis(1550);
+    let gap = decode_all(&req);
+    req.subtitle = None;
+    let gap_plain = decode_all(&req);
+    assert!(gap[0].rgb == gap_plain[0].rgb, "subtitle drawn outside its cue");
+}

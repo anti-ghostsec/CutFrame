@@ -12,6 +12,7 @@ use cutframe_core::{
 use eframe::egui::{self, Color32, RichText};
 
 use super::Tool;
+use crate::player::Player;
 
 const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "m4v", "webm", "avi", "ts", "flv", "wmv"];
 const OUTPUT_EXTS: &[&str] = &["mp4", "mkv", "webm", "mov"];
@@ -57,6 +58,7 @@ pub struct SubtitleTool {
 
     video: Option<PathBuf>,
     video_info: Option<Result<MediaInfo, String>>,
+    player: Option<Player>,
     subtitle: Option<PathBuf>,
     output: String,
     /// Once the user edits the output path we stop overwriting it.
@@ -80,6 +82,7 @@ impl SubtitleTool {
             engine,
             video: None,
             video_info: None,
+            player: None,
             subtitle: None,
             output: String::new(),
             output_touched: false,
@@ -96,7 +99,14 @@ impl SubtitleTool {
     }
 
     fn set_video(&mut self, path: PathBuf) {
-        self.video_info = Some(self.engine.probe(&path).map_err(|e| e.to_string()));
+        let info = self.engine.probe(&path).map_err(|e| e.to_string());
+        self.player = info.as_ref().ok().filter(|i| i.first_video().is_some()).map(|i| {
+            let fps = i.first_video().and_then(|v| v.frame_rate);
+            let mut p = Player::new(self.engine.clone(), path.clone(), i.duration, fps);
+            p.set_subtitle(self.subtitle.clone());
+            p
+        });
+        self.video_info = Some(info);
         self.video = Some(path);
         self.refresh_output();
     }
@@ -106,6 +116,9 @@ impl SubtitleTool {
             if let Some(stem) = path.file_stem() {
                 self.title = stem.to_string_lossy().into_owned();
             }
+        }
+        if let Some(p) = &mut self.player {
+            p.set_subtitle(Some(path.clone()));
         }
         self.subtitle = Some(path);
     }
@@ -125,11 +138,7 @@ impl SubtitleTool {
             i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect()
         });
         for path in dropped {
-            if SubtitleFormat::from_path(&path).is_some() {
-                self.set_subtitle(path);
-            } else if has_ext(&path, VIDEO_EXTS) {
-                self.set_video(path);
-            }
+            self.open(&path);
         }
     }
 
@@ -171,6 +180,9 @@ impl SubtitleTool {
             ctx.request_repaint();
         });
 
+        if let Some(p) = &mut self.player {
+            p.pause();
+        }
         self.status = Status::Idle;
         self.job = Some(RunningJob { rx, cancel, progress: None, started: Instant::now() });
     }
@@ -362,6 +374,17 @@ impl Tool for SubtitleTool {
         self.job.is_some()
     }
 
+    fn open(&mut self, path: &Path) -> bool {
+        if SubtitleFormat::from_path(path).is_some() {
+            self.set_subtitle(path.to_path_buf());
+        } else if has_ext(path, VIDEO_EXTS) {
+            self.set_video(path.to_path_buf());
+        } else {
+            return false;
+        }
+        true
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui) {
         self.poll_job();
         let busy = self.is_busy();
@@ -371,6 +394,9 @@ impl Tool for SubtitleTool {
 
         ui.add_enabled_ui(!busy, |ui| {
             section(ui, "1. Files", |ui| self.file_rows(ui));
+            if let Some(player) = &mut self.player {
+                section(ui, "Preview", |ui| player.ui(ui));
+            }
             section(ui, "2. How to embed", |ui| self.mode_section(ui));
             section(ui, "3. Output", |ui| self.output_row(ui));
         });

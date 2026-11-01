@@ -209,7 +209,7 @@ pub fn ffmpeg_args(req: &EmbedRequest, existing_subs: usize) -> Vec<OsString> {
 ///
 /// FFmpeg parses filter graphs twice: once for the option value and once for
 /// the graph, so special characters need two levels of escaping.
-fn escape_filter_path(path: &Path) -> String {
+pub(crate) fn escape_filter_path(path: &Path) -> String {
     // Forward slashes work on Windows too and avoid one class of escaping.
     let raw = path.to_string_lossy().replace('\\', "/");
     let level1 = escape_chars(&raw, &['\\', '\'', ':']);

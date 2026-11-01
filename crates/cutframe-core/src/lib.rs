@@ -10,6 +10,7 @@ pub mod error;
 pub mod ffmpeg;
 pub mod job;
 pub mod media;
+pub mod preview;
 pub mod subtitles;
 
 pub use engine::Engine;
@@ -17,4 +18,5 @@ pub use error::{Error, Result};
 pub use ffmpeg::FfmpegCli;
 pub use job::{CancelToken, Progress};
 pub use media::{MediaInfo, StreamInfo, StreamKind};
+pub use preview::{Frame, FrameSource, PreviewRequest};
 pub use subtitles::{EmbedMode, EmbedRequest, SubtitleFormat};

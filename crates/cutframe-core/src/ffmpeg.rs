@@ -3,8 +3,8 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::thread;
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -12,6 +12,7 @@ use serde::Deserialize;
 use crate::engine::Engine;
 use crate::job::{CancelToken, Progress};
 use crate::media::{MediaInfo, StreamInfo, StreamKind};
+use crate::preview::{self, Frame, FrameSource, PreviewRequest};
 use crate::subtitles::{ffmpeg_args, EmbedRequest};
 use crate::{Error, Result};
 
@@ -123,6 +124,69 @@ impl Engine for FfmpegCli {
         }
         Ok(())
     }
+
+    fn open_preview(&self, req: &PreviewRequest) -> Result<Box<dyn FrameSource>> {
+        if !req.video.is_file() {
+            return Err(Error::MissingFile(req.video.clone()));
+        }
+        let mut child = command(&self.ffmpeg)
+            .args(preview::ffmpeg_args(req))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| spawn_error(&self.ffmpeg, e))?;
+        let stderr = child.stderr.take().expect("stderr piped");
+        let stdout = BufReader::with_capacity(1 << 20, child.stdout.take().expect("stdout piped"));
+        Ok(Box::new(FfmpegFrames {
+            child,
+            stdout,
+            log: Some(thread::spawn(move || tail_lines(stderr, LOG_TAIL))),
+            start: req.start,
+            frame_time: 1.0 / req.fps,
+            decoded: 0,
+        }))
+    }
+}
+
+/// Frames read from an `ffmpeg ... -f image2pipe -c:v ppm pipe:1` process.
+struct FfmpegFrames {
+    child: Child,
+    stdout: BufReader<ChildStdout>,
+    log: Option<JoinHandle<String>>,
+    start: Duration,
+    frame_time: f64,
+    decoded: u64,
+}
+
+impl FrameSource for FfmpegFrames {
+    fn next_frame(&mut self) -> Result<Option<Frame>> {
+        match preview::read_ppm(&mut self.stdout) {
+            Ok(Some((width, height, rgb))) => {
+                // The fps filter spaces output frames evenly from the seek point.
+                let pts = self.start + Duration::from_secs_f64(self.decoded as f64 * self.frame_time);
+                self.decoded += 1;
+                Ok(Some(Frame { pts, width, height, rgb }))
+            }
+            Ok(None) => {
+                let status = self.child.wait()?;
+                let log = self.log.take().and_then(|h| h.join().ok()).unwrap_or_default();
+                if status.success() {
+                    Ok(None)
+                } else {
+                    Err(Error::Ffmpeg { code: status.code(), log })
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl Drop for FfmpegFrames {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 fn read_progress(
@@ -208,6 +272,8 @@ struct ProbeStream {
     codec_name: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
+    avg_frame_rate: Option<String>,
+    r_frame_rate: Option<String>,
     #[serde(default)]
     tags: std::collections::HashMap<String, String>,
 }
@@ -235,6 +301,8 @@ fn parse_probe(json: &[u8]) -> Result<MediaInfo> {
             language: s.tags.get("language").cloned(),
             width: s.width,
             height: s.height,
+            frame_rate: parse_rate(s.avg_frame_rate.as_deref())
+                .or_else(|| parse_rate(s.r_frame_rate.as_deref())),
         })
         .collect();
     let (format, duration) = match p.format {
@@ -250,6 +318,14 @@ fn parse_probe(json: &[u8]) -> Result<MediaInfo> {
     Ok(MediaInfo { format, duration, streams })
 }
 
+/// Parse ffprobe rates like "30000/1001". "0/0" means unknown.
+fn parse_rate(r: Option<&str>) -> Option<f64> {
+    let (n, d) = r?.split_once('/')?;
+    let (n, d): (f64, f64) = (n.parse().ok()?, d.parse().ok()?);
+    let fps = n / d;
+    (fps.is_finite() && fps > 0.0).then_some(fps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,7 +333,7 @@ mod tests {
     #[test]
     fn parses_ffprobe_json() {
         let json = br#"{"streams":[
-            {"index":0,"codec_type":"video","codec_name":"h264","width":640,"height":360},
+            {"index":0,"codec_type":"video","codec_name":"h264","width":640,"height":360,"avg_frame_rate":"30000/1001"},
             {"index":1,"codec_type":"audio","codec_name":"aac","tags":{"language":"eng"}},
             {"index":2,"codec_type":"subtitle","codec_name":"subrip"}],
             "format":{"format_name":"matroska,webm","duration":"12.500000"}}"#;
@@ -265,5 +341,7 @@ mod tests {
         assert_eq!(info.count(StreamKind::Subtitle), 1);
         assert_eq!(info.duration, Some(Duration::from_millis(12_500)));
         assert_eq!(info.streams[1].language.as_deref(), Some("eng"));
+        assert!((info.streams[0].frame_rate.unwrap() - 29.97).abs() < 0.01);
+        assert_eq!(parse_rate(Some("0/0")), None);
     }
 }

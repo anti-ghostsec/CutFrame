@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::job::{CancelToken, Progress};
 use crate::media::MediaInfo;
+use crate::preview::{FrameSource, PreviewRequest};
 use crate::subtitles::EmbedRequest;
 use crate::Result;
 
@@ -20,4 +21,7 @@ pub trait Engine: Send + Sync {
         on_progress: &mut dyn FnMut(Progress),
         cancel: &CancelToken,
     ) -> Result<()>;
+
+    /// Start decoding frames for on-screen preview.
+    fn open_preview(&self, req: &PreviewRequest) -> Result<Box<dyn FrameSource>>;
 }

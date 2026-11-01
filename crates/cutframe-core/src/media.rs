@@ -16,6 +16,8 @@ pub struct StreamInfo {
     pub language: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Average frames per second (video only).
+    pub frame_rate: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
