@@ -241,6 +241,24 @@ impl Tool for SubtitleTool {
         "Embed subtitles"
     }
 
+    fn icon(&self) -> &'static str {
+        "💬"
+    }
+
+    fn description(&self) -> &'static str {
+        "Add a subtitle file to a video as a track, or burn it into the picture."
+    }
+
+    fn poll(&mut self) {
+        self.job.poll();
+    }
+
+    fn on_hide(&mut self) {
+        if let Some(p) = &mut self.player {
+            p.pause();
+        }
+    }
+
     fn is_busy(&self) -> bool {
         self.job.is_busy()
     }
@@ -257,7 +275,6 @@ impl Tool for SubtitleTool {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
-        self.job.poll();
         let busy = self.is_busy();
         if !busy {
             for path in dropped_files(ui.ctx()) {

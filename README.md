@@ -2,7 +2,9 @@
 
 A cross-platform video tool written in Rust. Right now it can **embed subtitles** and **trim/cut videos**. It's meant to grow into a full video editor for Windows, Linux and Android.
 
-## Features (v0.3)
+## Features (v0.4)
+
+CutFrame opens on a **Home** screen with a card for each tool. A sidebar on the left switches tools at any time. A video dropped on Home opens in every tool that can use it, and a job keeps running in the background while you use another tool.
 
 ### Embed subtitles
 
@@ -24,7 +26,7 @@ A cross-platform video tool written in Rust. Right now it can **embed subtitles*
 
 ### General
 
-- Supports drag and drop. You can open files from the command line: `cutframe video.mp4 subs.srt`, or `cutframe --trim video.mp4` to start on the Trim tab.
+- Supports drag and drop. You can open files from the command line: `cutframe video.mp4 subs.srt`. Add `--trim` or `--subtitles` to skip Home and start in that tool.
 - Shows a live progress bar and has a Cancel button.
 
 ## Running
@@ -56,7 +58,7 @@ crates/
     media.rs         MediaInfo / StreamInfo from probing
     job.rs           Progress + CancelToken for long-running jobs
   cutframe-app/    egui/eframe GUI
-    app.rs           Shell: tool tabs + status bar
+    app.rs           Shell: Home screen, sidebar navigation, status bar
     player.rs        Reusable preview widget (decoder thread + frame clock)
     tools/           One module per tool (screen)
       common.rs        Shared pieces: file pickers, output field, JobRunner

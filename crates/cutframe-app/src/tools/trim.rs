@@ -355,6 +355,24 @@ impl Tool for TrimTool {
         "Trim / Cut"
     }
 
+    fn icon(&self) -> &'static str {
+        "✂"
+    }
+
+    fn description(&self) -> &'static str {
+        "Keep only the parts you want, or cut sections out of a video."
+    }
+
+    fn poll(&mut self) {
+        self.job.poll();
+    }
+
+    fn on_hide(&mut self) {
+        if let Some(p) = &mut self.player {
+            p.pause();
+        }
+    }
+
     fn is_busy(&self) -> bool {
         self.job.is_busy()
     }
@@ -369,7 +387,6 @@ impl Tool for TrimTool {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
-        self.job.poll();
         let busy = self.is_busy();
         if !busy {
             for path in dropped_files(ui.ctx()) {
