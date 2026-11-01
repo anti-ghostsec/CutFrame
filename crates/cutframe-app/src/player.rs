@@ -121,7 +121,20 @@ impl Player {
         }
     }
 
-    fn seek(&mut self, to: Duration) {
+    /// Timestamp of the frame on screen.
+    pub fn position(&self) -> Duration {
+        self.position
+    }
+
+    pub fn duration(&self) -> Option<Duration> {
+        self.duration
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.playing
+    }
+
+    pub fn seek(&mut self, to: Duration) {
         self.position = self.duration.map_or(to, |d| to.min(d));
         self.restart();
     }

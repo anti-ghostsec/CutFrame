@@ -60,6 +60,35 @@ impl MediaInfo {
     }
 }
 
+/// Precise timestamp for editing, e.g. "1:02.500" or "1:00:02.500".
+pub fn format_timestamp(d: Duration) -> String {
+    let ms = d.as_millis();
+    let (h, m, s, ms) = (ms / 3_600_000, (ms / 60_000) % 60, (ms / 1000) % 60, ms % 1000);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}.{ms:03}")
+    } else {
+        format!("{m}:{s:02}.{ms:03}")
+    }
+}
+
+/// Parse "90", "1:30", "1:30.25" or "0:01:30.250".
+pub fn parse_timestamp(s: &str) -> Option<Duration> {
+    let mut secs = 0.0;
+    let parts: Vec<&str> = s.trim().split(':').collect();
+    if parts.len() > 3 {
+        return None;
+    }
+    for (i, part) in parts.iter().enumerate() {
+        let v: f64 = part.trim().parse().ok()?;
+        let is_last = i == parts.len() - 1;
+        if v < 0.0 || !v.is_finite() || (!is_last && v.fract() != 0.0) || (i > 0 && v >= 60.0) {
+            return None;
+        }
+        secs = secs * 60.0 + v;
+    }
+    Some(Duration::from_secs_f64(secs))
+}
+
 pub fn format_duration(d: Duration) -> String {
     let s = d.as_secs();
     let (h, m, s) = (s / 3600, (s / 60) % 60, s % 60);
@@ -67,5 +96,21 @@ pub fn format_duration(d: Duration) -> String {
         format!("{h}:{m:02}:{s:02}")
     } else {
         format!("{m}:{s:02}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamps_round_trip() {
+        let d = Duration::from_millis(3_725_250);
+        assert_eq!(format_timestamp(d), "1:02:05.250");
+        assert_eq!(parse_timestamp("1:02:05.250"), Some(d));
+        assert_eq!(parse_timestamp("90"), Some(Duration::from_secs(90)));
+        assert_eq!(parse_timestamp("1:30.5"), Some(Duration::from_millis(90_500)));
+        assert_eq!(parse_timestamp("1:75"), None);
+        assert_eq!(parse_timestamp("abc"), None);
     }
 }

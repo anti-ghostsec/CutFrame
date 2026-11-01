@@ -3,7 +3,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cutframe_core::{CancelToken, EmbedMode, EmbedRequest, Engine, FfmpegCli, StreamKind};
+use std::time::Duration;
+
+use cutframe_core::{
+    Accuracy, CancelToken, EmbedMode, EmbedRequest, Engine, FfmpegCli, MediaInfo, Selection,
+    StreamKind, TimeRange, TrimRequest,
+};
 
 const SRT: &str = "1\n00:00:00,200 --> 00:00:01,500\nHello, world!\n\n2\n00:00:01,600 --> 00:00:02,800\nSecond line\n";
 
@@ -20,9 +25,10 @@ fn workdir(name: &str) -> Option<PathBuf> {
 
 fn make_video(path: &Path) {
     let ok = Command::new("ffmpeg")
-        .args(["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=3"])
-        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=3"])
-        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+        .args(["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=6"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=6"])
+        // A keyframe every second so fast (copy) cuts have somewhere to land.
+        .args(["-c:v", "libx264", "-g", "25", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
         .arg(path)
         .status()
         .unwrap()
@@ -124,7 +130,7 @@ fn preview_streams_scaled_frames() {
     req.max_width = 160;
     req.fps = 10.0;
     let frames = decode_all(&req);
-    assert!((29..=31).contains(&frames.len()), "got {} frames", frames.len());
+    assert!((59..=61).contains(&frames.len()), "got {} frames", frames.len());
     let f = &frames[0];
     assert_eq!((f.width, f.height), (160, 120));
     assert_eq!(f.rgb.len(), 160 * 120 * 3);
@@ -156,4 +162,54 @@ fn preview_after_seek_draws_subtitles() {
     req.subtitle = None;
     let gap_plain = decode_all(&req);
     assert!(gap[0].rgb == gap_plain[0].rgb, "subtitle drawn outside its cue");
+}
+
+fn trim(name: &str, sel: &[(f64, f64)], selection: Selection, accuracy: Accuracy) -> Option<MediaInfo> {
+    let dir = workdir(name)?;
+    let video = dir.join("in.mp4");
+    make_video(&video);
+    let ranges: Vec<TimeRange> = sel
+        .iter()
+        .map(|&(a, b)| TimeRange::new(Duration::from_secs_f64(a), Duration::from_secs_f64(b)))
+        .collect();
+    let keep = cutframe_core::edit::keep_ranges(&ranges, selection, Duration::from_secs(6));
+    let mut req = TrimRequest::new(video, dir.join("out.mp4"), keep);
+    req.accuracy = accuracy;
+    req.preset = "ultrafast".into();
+    let mut last = None;
+    FfmpegCli::locate()
+        .trim(&req, &mut |p| last = p.fraction(), &CancelToken::new())
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(last, Some(1.0));
+    Some(FfmpegCli::locate().probe(&req.output).unwrap())
+}
+
+fn assert_secs(info: &MediaInfo, expected: f64, tolerance: f64) {
+    let got = info.duration.unwrap().as_secs_f64();
+    assert!((got - expected).abs() <= tolerance, "expected ~{expected}s, got {got}s");
+}
+
+#[test]
+fn trim_fast_keeps_one_range() {
+    let Some(info) = trim("trim-fast", &[(1.0, 3.0)], Selection::Keep, Accuracy::Fast) else { return };
+    // Stream copy cuts on packet boundaries, so allow a few frames of slack.
+    assert_secs(&info, 2.0, 0.25);
+    assert_eq!(info.count(StreamKind::Audio), 1);
+}
+
+#[test]
+fn trim_fast_joins_several_ranges() {
+    let sel = [(1.0, 2.0), (3.0, 5.0)];
+    let Some(info) = trim("trim-fast-multi", &sel, Selection::Keep, Accuracy::Fast) else { return };
+    assert_secs(&info, 3.0, 0.3);
+}
+
+#[test]
+fn cut_precise_removes_ranges_frame_accurately() {
+    // Off-keyframe cut points: only re-encoding can hit these exactly.
+    let sel = [(1.3, 2.1), (4.45, 5.0)];
+    let Some(info) = trim("cut-precise", &sel, Selection::Remove, Accuracy::Precise) else { return };
+    assert_secs(&info, 6.0 - 0.8 - 0.55, 0.08);
+    assert_eq!(info.count(StreamKind::Audio), 1);
+    assert_eq!(info.first_video().unwrap().codec, "h264");
 }

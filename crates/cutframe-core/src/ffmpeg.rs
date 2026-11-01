@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::edit::{self, TrimRequest};
 use crate::engine::Engine;
 use crate::job::{CancelToken, Progress};
 use crate::media::{MediaInfo, StreamInfo, StreamKind};
@@ -94,35 +95,26 @@ impl Engine for FfmpegCli {
         req.validate()?;
         let info = self.probe(&req.video)?;
         let args = ffmpeg_args(req, info.count(StreamKind::Subtitle));
+        self.run_job(&args, info.duration, &req.output, on_progress, cancel)
+    }
 
-        let mut child = command(&self.ffmpeg)
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| spawn_error(&self.ffmpeg, e))?;
-
-        // Drain stderr on its own thread so ffmpeg never blocks on a full pipe.
-        let stderr = child.stderr.take().expect("stderr piped");
-        let log = thread::spawn(move || tail_lines(stderr, LOG_TAIL));
-
-        let stdout = child.stdout.take().expect("stdout piped");
-        let result = read_progress(stdout, info.duration, on_progress, cancel, &mut child);
-
-        let status = child.wait()?;
-        let log = log.join().unwrap_or_default();
-
-        if cancel.is_cancelled() {
-            let _ = std::fs::remove_file(&req.output);
-            return Err(Error::Cancelled);
+    fn trim(
+        &self,
+        req: &TrimRequest,
+        on_progress: &mut dyn FnMut(Progress),
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        req.validate()?;
+        let has_audio = self.probe(&req.input)?.count(StreamKind::Audio) > 0;
+        let script = std::env::temp_dir()
+            .join(format!("cutframe-{}-{:p}.ffconcat", std::process::id(), req));
+        if req.accuracy == edit::Accuracy::Fast {
+            std::fs::write(&script, edit::concat_script(req))?;
         }
-        result?;
-        if !status.success() {
-            let _ = std::fs::remove_file(&req.output);
-            return Err(Error::Ffmpeg { code: status.code(), log });
-        }
-        Ok(())
+        let args = edit::ffmpeg_args(req, &script, has_audio);
+        let result = self.run_job(&args, Some(req.output_duration()), &req.output, on_progress, cancel);
+        let _ = std::fs::remove_file(&script);
+        result
     }
 
     fn open_preview(&self, req: &PreviewRequest) -> Result<Box<dyn FrameSource>> {
@@ -146,6 +138,48 @@ impl Engine for FfmpegCli {
             frame_time: 1.0 / req.fps,
             decoded: 0,
         }))
+    }
+}
+
+impl FfmpegCli {
+    /// Run an ffmpeg job that writes `-progress pipe:1`, deleting `output` if
+    /// it fails or is cancelled.
+    fn run_job(
+        &self,
+        args: &[std::ffi::OsString],
+        total: Option<Duration>,
+        output: &Path,
+        on_progress: &mut dyn FnMut(Progress),
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        let mut child = command(&self.ffmpeg)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| spawn_error(&self.ffmpeg, e))?;
+
+        // Drain stderr on its own thread so ffmpeg never blocks on a full pipe.
+        let stderr = child.stderr.take().expect("stderr piped");
+        let log = thread::spawn(move || tail_lines(stderr, LOG_TAIL));
+
+        let stdout = child.stdout.take().expect("stdout piped");
+        let result = read_progress(stdout, total, on_progress, cancel, &mut child);
+
+        let status = child.wait()?;
+        let log = log.join().unwrap_or_default();
+
+        if cancel.is_cancelled() {
+            let _ = std::fs::remove_file(output);
+            return Err(Error::Cancelled);
+        }
+        result?;
+        if !status.success() {
+            let _ = std::fs::remove_file(output);
+            return Err(Error::Ffmpeg { code: status.code(), log });
+        }
+        Ok(())
     }
 }
 

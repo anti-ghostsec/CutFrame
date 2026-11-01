@@ -11,6 +11,9 @@ pub enum Error {
     #[error("unsupported subtitle file: {0} (use .srt, .ass, .ssa or .vtt)")]
     UnsupportedSubtitle(PathBuf),
 
+    #[error("nothing would be left: choose at least one part of the video to keep")]
+    NothingToKeep,
+
     #[error("output must be different from the input video")]
     OutputIsInput,
 

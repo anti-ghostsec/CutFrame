@@ -5,6 +5,7 @@
 //! libav* or Android MediaCodec) can implement the same trait without the GUI
 //! or the future editor timeline having to change.
 
+pub mod edit;
 pub mod engine;
 pub mod error;
 pub mod ffmpeg;
@@ -13,6 +14,7 @@ pub mod media;
 pub mod preview;
 pub mod subtitles;
 
+pub use edit::{Accuracy, Selection, TimeRange, TrimRequest};
 pub use engine::Engine;
 pub use error::{Error, Result};
 pub use ffmpeg::FfmpegCli;

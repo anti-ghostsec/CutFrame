@@ -2,7 +2,9 @@
 //! is the first, and future editor features (trim, merge, timeline…) get added
 //! here as new tools.
 
+pub mod common;
 pub mod subtitles;
+pub mod trim;
 
 pub trait Tool {
     fn name(&self) -> &'static str;

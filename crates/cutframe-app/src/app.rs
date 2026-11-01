@@ -4,7 +4,7 @@ use std::sync::Arc;
 use cutframe_core::{Engine, FfmpegCli};
 use eframe::egui;
 
-use crate::tools::{subtitles::SubtitleTool, Tool};
+use crate::tools::{subtitles::SubtitleTool, trim::TrimTool, Tool};
 
 pub struct CutFrameApp {
     engine_name: String,
@@ -14,16 +14,31 @@ pub struct CutFrameApp {
 }
 
 impl CutFrameApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> Self {
+    /// `start_tool` picks the initial tab by name; `files` are opened in it
+    /// (or in the first tool that accepts them).
+    pub fn new(
+        _cc: &eframe::CreationContext<'_>,
+        start_tool: Option<&str>,
+        files: Vec<PathBuf>,
+    ) -> Self {
         let engine: Arc<dyn Engine> = Arc::new(FfmpegCli::locate());
         let mut app = Self {
             engine_name: engine.name(),
-            tools: vec![Box::new(SubtitleTool::new(engine))],
+            tools: vec![
+                Box::new(SubtitleTool::new(engine.clone())),
+                Box::new(TrimTool::new(engine)),
+            ],
             active: 0,
             dev_screenshot: dev::Screenshot::from_env(),
         };
+        if let Some(i) = app.tools.iter().position(|t| Some(t.name()) == start_tool) {
+            app.active = i;
+        }
         for f in files {
-            app.tools.iter_mut().any(|t| t.open(&f));
+            let active = app.active;
+            if !app.tools[active].open(&f) {
+                app.tools.iter_mut().any(|t| t.open(&f));
+            }
         }
         app
     }

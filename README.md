@@ -1,8 +1,11 @@
 # CutFrame
 
-A cross-platform video tool written in Rust. Right now it does one thing: **embed subtitle files into videos**. It's meant to grow into a full video editor for Windows, Linux and Android.
+A cross-platform video tool written in Rust. Right now it can **embed subtitles** and **trim/cut videos**. It's meant to grow into a full video editor for Windows, Linux and Android.
 
-## Features (v0.2)
+## Features (v0.3)
+
+### Embed subtitles
+
 
 - **Soft subtitles**: adds the subtitles as a separate track that viewers can turn on or off. Video and audio are copied as-is, so it's fast and the quality doesn't change.
 - **Hard subtitles (burn-in)**: draws the subtitles into the picture so they show on every player and website. This re-encodes the video (H.264, or VP9 for `.webm`).
@@ -10,7 +13,19 @@ A cross-platform video tool written in Rust. Right now it does one thing: **embe
 - Picks the right subtitle codec for the output: `mov_text` for MP4/MOV, copied as-is for MKV, `webvtt` for WebM.
 - Sets the subtitle language and title, marks the track as default, and keeps any subtitle tracks the video already has.
 - **Preview player:** play, pause (Space) and scrub through the video with the subtitles drawn on top, exactly as burn-in will render them. A checkbox turns the overlay off.
-- Supports drag and drop and opening files from the command line (`cutframe video.mp4 subs.srt`). Shows a live progress bar and has a Cancel button.
+
+### Trim / Cut
+
+- Mark ranges on the preview with **Set In / Set Out** (keys `I` / `O`, or type times like `1:02.5`). Press **Add range** (`Enter`) to queue several.
+- **Keep selected parts** trims the video down to them. **Remove selected parts** cuts them out and keeps the rest. Several ranges are joined in order.
+- A timeline bar shows the selection and the playhead. Click it to jump.
+- **Fast:** stream copy. Instant and lossless, but cuts snap to keyframes.
+- **Precise:** re-encodes to H.264/AAC for frame-exact cuts.
+
+### General
+
+- Supports drag and drop. You can open files from the command line: `cutframe video.mp4 subs.srt`, or `cutframe --trim video.mp4` to start on the Trim tab.
+- Shows a live progress bar and has a Cancel button.
 
 ## Running
 
@@ -36,13 +51,17 @@ crates/
     engine.rs        `Engine` trait: the seam for swapping media backends
     ffmpeg.rs        FfmpegCli: engine that drives ffmpeg/ffprobe executables
     subtitles.rs     EmbedRequest + ffmpeg argument building (pure, unit-tested)
+    edit.rs          TimeRange / keep_ranges / TrimRequest (trim & cut)
     preview.rs       PreviewRequest / Frame / FrameSource for on-screen playback
     media.rs         MediaInfo / StreamInfo from probing
     job.rs           Progress + CancelToken for long-running jobs
   cutframe-app/    egui/eframe GUI
     app.rs           Shell: tool tabs + status bar
     player.rs        Reusable preview widget (decoder thread + frame clock)
-    tools/           One module per tool (screen). Subtitles is the first.
+    tools/           One module per tool (screen)
+      common.rs        Shared pieces: file pickers, output field, JobRunner
+      subtitles.rs     Embed subtitles tab
+      trim.rs          Trim / Cut tab
 ```
 
 ## Design notes for the full editor
@@ -62,7 +81,7 @@ crates/
 
 1. ~~Embed subtitles (soft/hard)~~
 2. ~~Video preview player~~ (audio playback still to do)
-3. Trim / cut / concatenate
+3. ~~Trim / cut~~. Still to do: joining separate files (concatenate).
 4. Timeline with multiple tracks
 5. Subtitle editor (edit timings and text in-app)
 6. Android build + packaging (cargo-apk / xbuild); Windows installer

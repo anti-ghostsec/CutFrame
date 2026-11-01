@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::edit::TrimRequest;
 use crate::job::{CancelToken, Progress};
 use crate::media::MediaInfo;
 use crate::preview::{FrameSource, PreviewRequest};
@@ -18,6 +19,14 @@ pub trait Engine: Send + Sync {
     fn embed_subtitles(
         &self,
         req: &EmbedRequest,
+        on_progress: &mut dyn FnMut(Progress),
+        cancel: &CancelToken,
+    ) -> Result<()>;
+
+    /// Cut a video down to the request's kept ranges.
+    fn trim(
+        &self,
+        req: &TrimRequest,
         on_progress: &mut dyn FnMut(Progress),
         cancel: &CancelToken,
     ) -> Result<()>;
