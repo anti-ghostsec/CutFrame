@@ -1,0 +1,106 @@
+//! End-to-end tests against the real ffmpeg. Skipped if ffmpeg isn't installed.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use cutframe_core::{CancelToken, EmbedMode, EmbedRequest, Engine, FfmpegCli, StreamKind};
+
+const SRT: &str = "1\n00:00:00,200 --> 00:00:01,500\nHello, world!\n\n2\n00:00:01,600 --> 00:00:02,800\nSecond line\n";
+
+fn workdir(name: &str) -> Option<PathBuf> {
+    if FfmpegCli::locate().version().is_err() {
+        eprintln!("ffmpeg not found, skipping");
+        return None;
+    }
+    let dir = std::env::temp_dir().join(format!("cutframe-test-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    Some(dir)
+}
+
+fn make_video(path: &Path) {
+    let ok = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=3"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=3"])
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+        .arg(path)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "could not create sample video");
+}
+
+fn run(req: &EmbedRequest) -> Vec<f32> {
+    let mut seen = Vec::new();
+    FfmpegCli::locate()
+        .embed_subtitles(req, &mut |p| seen.extend(p.fraction()), &CancelToken::new())
+        .unwrap_or_else(|e| panic!("{e}"));
+    seen
+}
+
+#[test]
+fn soft_mp4_adds_tagged_track() {
+    let Some(dir) = workdir("soft-mp4") else { return };
+    let (video, subs, out) = (dir.join("in.mp4"), dir.join("subs.srt"), dir.join("out.mp4"));
+    make_video(&video);
+    std::fs::write(&subs, SRT).unwrap();
+
+    let mut req = EmbedRequest::new(video, subs, out.clone());
+    req.language = Some("eng".into());
+    let progress = run(&req);
+    assert_eq!(progress.last().copied(), Some(1.0));
+
+    let info = FfmpegCli::locate().probe(&out).unwrap();
+    let sub = info.streams.iter().find(|s| s.kind == StreamKind::Subtitle).unwrap();
+    assert_eq!(sub.codec, "mov_text");
+    assert_eq!(sub.language.as_deref(), Some("eng"));
+    assert_eq!(info.count(StreamKind::Audio), 1);
+}
+
+#[test]
+fn soft_mkv_keeps_existing_and_appends() {
+    let Some(dir) = workdir("soft-mkv") else { return };
+    let (video, subs) = (dir.join("in.mp4"), dir.join("subs.srt"));
+    make_video(&video);
+    std::fs::write(&subs, SRT).unwrap();
+
+    let first = dir.join("one.mkv");
+    run(&EmbedRequest::new(video, subs.clone(), first.clone()));
+    let second = dir.join("two.mkv");
+    run(&EmbedRequest::new(first, subs, second.clone()));
+
+    let info = FfmpegCli::locate().probe(&second).unwrap();
+    assert_eq!(info.count(StreamKind::Subtitle), 2);
+}
+
+#[test]
+fn hard_burn_with_awkward_filename() {
+    let Some(dir) = workdir("hard") else { return };
+    let video = dir.join("in.mp4");
+    // Quotes, colons, commas and brackets all need escaping in -vf.
+    let subs = dir.join("it's [a]: weird, name.srt");
+    make_video(&video);
+    std::fs::write(&subs, SRT).unwrap();
+
+    let mut req = EmbedRequest::new(video, subs, dir.join("burned.mp4"));
+    req.mode = EmbedMode::Hard;
+    req.preset = "ultrafast".into();
+    run(&req);
+
+    let info = FfmpegCli::locate().probe(&req.output).unwrap();
+    assert_eq!(info.count(StreamKind::Subtitle), 0);
+    assert_eq!(info.first_video().unwrap().codec, "h264");
+}
+
+#[test]
+fn rejects_output_equal_to_input() {
+    let Some(dir) = workdir("same") else { return };
+    let (video, subs) = (dir.join("in.mp4"), dir.join("subs.srt"));
+    make_video(&video);
+    std::fs::write(&subs, SRT).unwrap();
+    let req = EmbedRequest::new(video.clone(), subs, video);
+    let err = FfmpegCli::locate()
+        .embed_subtitles(&req, &mut |_| {}, &CancelToken::new())
+        .unwrap_err();
+    assert!(matches!(err, cutframe_core::Error::OutputIsInput));
+}

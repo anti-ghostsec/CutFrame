@@ -1,0 +1,18 @@
+[package]
+name = "cutframe-app"
+description = "CutFrame desktop/mobile GUI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cutframe"
+path = "src/main.rs"
+
+[dependencies]
+cutframe-core = { path = "../cutframe-core" }
+eframe = "0.37"
+
+# Native file dialogs exist on desktop only; Android will use the system picker.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rfd = "0.17"

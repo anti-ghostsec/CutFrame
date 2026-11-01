@@ -1,0 +1,7 @@
+1
+00:00:00,500 --> 00:00:03,000
+Hello from CutFrame!
+
+2
+00:00:03,200 --> 00:00:06,000
+Subtitles embedded with Rust + FFmpeg
