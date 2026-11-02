@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use crate::edit::TrimRequest;
 use crate::job::{CancelToken, Progress};
@@ -14,6 +15,10 @@ pub trait Engine: Send + Sync {
 
     /// Read container/stream information from a media file.
     fn probe(&self, path: &Path) -> Result<MediaInfo>;
+
+    /// Timestamps of the video keyframes, sorted. Fast (copy) cuts can only
+    /// start on these.
+    fn keyframes(&self, path: &Path) -> Result<Vec<Duration>>;
 
     /// Put a subtitle file into a video, reporting progress as it goes.
     fn embed_subtitles(

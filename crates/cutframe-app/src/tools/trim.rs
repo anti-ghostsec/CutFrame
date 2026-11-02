@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
-use cutframe_core::edit::{default_output, keep_ranges};
+use cutframe_core::edit::{default_output, keep_ranges, snap_to_keyframes};
 use cutframe_core::media::{format_duration, format_timestamp, parse_timestamp};
 use cutframe_core::{Accuracy, Engine, MediaInfo, Selection, TimeRange, TrimRequest};
 use eframe::egui::{self, Color32, RichText, Stroke};
@@ -62,6 +64,10 @@ pub struct TrimTool {
     video: Option<PathBuf>,
     video_info: Option<Result<MediaInfo, String>>,
     player: Option<Player>,
+    /// Keyframe times, loaded in the background (Fast mode can only start
+    /// parts on these).
+    keyframes: Option<Vec<Duration>>,
+    keyframes_rx: Option<Receiver<Vec<Duration>>>,
 
     mark_in: Mark,
     mark_out: Mark,
@@ -83,6 +89,8 @@ impl TrimTool {
             video: None,
             video_info: None,
             player: None,
+            keyframes: None,
+            keyframes_rx: None,
             mark_in: Mark::default(),
             mark_out: Mark::default(),
             ranges: Vec::new(),
@@ -102,11 +110,29 @@ impl TrimTool {
             Player::new(self.engine.clone(), path.clone(), i.duration, fps)
         });
         self.output.suggest(default_output(&path));
+        self.keyframes = None;
+        self.keyframes_rx = info.is_ok().then(|| {
+            let (tx, rx) = mpsc::channel();
+            let (engine, path) = (self.engine.clone(), path.clone());
+            // Can take a moment on long videos: keep the UI responsive.
+            thread::spawn(move || {
+                if let Ok(k) = engine.keyframes(&path) {
+                    let _ = tx.send(k);
+                }
+            });
+            rx
+        });
         self.video_info = Some(info);
         self.video = Some(path);
         self.ranges.clear();
         self.mark_in.clear();
         self.mark_out.clear();
+    }
+
+    /// What Fast mode will actually keep (parts start at keyframes), once
+    /// keyframes are known.
+    fn fast_keep(&self) -> Option<Vec<TimeRange>> {
+        Some(snap_to_keyframes(&self.keep(), self.keyframes.as_ref()?))
     }
 
     fn duration(&self) -> Option<Duration> {
@@ -218,6 +244,19 @@ impl TrimTool {
         if let Some(r) = self.pending_range() {
             painter.rect_filled(span(&r), 0.0, MARK_COLOR.gamma_multiply(0.7));
         }
+        // Fast mode can only start parts on keyframes: show where they are,
+        // unless they're so dense the ticks would just fill the bar.
+        if let (Accuracy::Fast, Some(keys)) = (self.accuracy, &self.keyframes) {
+            if (keys.len() as f32) < rect.width() / 4.0 {
+                for k in keys {
+                    let x = x_of(*k);
+                    painter.line_segment(
+                        [egui::pos2(x, rect.bottom() - 6.0), egui::pos2(x, rect.bottom())],
+                        Stroke::new(1.0, Color32::from_gray(170)),
+                    );
+                }
+            }
+        }
         for t in [self.mark_in.value, self.mark_out.value].into_iter().flatten() {
             let x = x_of(t);
             painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], Stroke::new(2.0, MARK_COLOR));
@@ -312,6 +351,21 @@ impl TrimTool {
                 keep.len(),
                 if keep.len() == 1 { "" } else { "s" }
             ));
+            if self.accuracy == Accuracy::Fast {
+                if let Some(fast) = self.fast_keep().filter(|f| *f != keep) {
+                    let fast_total: Duration = fast.iter().map(TimeRange::len).sum();
+                    let starts: Vec<String> = fast.iter().map(|r| format_timestamp(r.start)).collect();
+                    ui.small(
+                        RichText::new(format!(
+                            "Fast mode can only start at keyframes, so you'll get {} (starting at {}). \
+                             Choose Precise for exact cuts.",
+                            format_timestamp(fast_total),
+                            starts.join(", ")
+                        ))
+                        .color(Color32::YELLOW),
+                    );
+                }
+            }
         }
     }
 
@@ -365,6 +419,10 @@ impl Tool for TrimTool {
 
     fn poll(&mut self) {
         self.job.poll();
+        if let Some(keys) = self.keyframes_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.keyframes = Some(keys);
+            self.keyframes_rx = None;
+        }
     }
 
     fn on_hide(&mut self) {
@@ -436,6 +494,9 @@ mod tests {
                 }],
             })
         }
+        fn keyframes(&self, _: &Path) -> cutframe_core::Result<Vec<Duration>> {
+            Ok((0..=10).step_by(5).map(Duration::from_secs).collect())
+        }
         fn embed_subtitles(
             &self,
             _: &EmbedRequest,
@@ -501,6 +562,22 @@ mod tests {
             t.keep(),
             vec![TimeRange::new(secs(0), secs(1)), TimeRange::new(secs(2), secs(8))]
         );
+    }
+
+    #[test]
+    fn fast_mode_preview_snaps_to_keyframes() {
+        let mut t = tool();
+        // Keyframes load on a thread; wait for them like the UI would.
+        for _ in 0..100 {
+            t.poll();
+            if t.keyframes.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        t.mark_in.set(secs(7));
+        t.mark_out.set(secs(9));
+        assert_eq!(t.fast_keep(), Some(vec![TimeRange::new(secs(5), secs(9))]));
     }
 
     #[test]

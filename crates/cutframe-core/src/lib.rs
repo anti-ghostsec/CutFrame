@@ -12,6 +12,7 @@ pub mod ffmpeg;
 pub mod job;
 pub mod media;
 pub mod preview;
+pub mod retime;
 pub mod subtitles;
 
 pub use edit::{Accuracy, Selection, TimeRange, TrimRequest};

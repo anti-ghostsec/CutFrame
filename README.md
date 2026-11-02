@@ -21,8 +21,9 @@ CutFrame opens on a **Home** screen with a card for each tool. A sidebar on the 
 - Mark ranges on the preview with **Set In / Set Out** (keys `I` / `O`, or type times like `1:02.5`). Press **Add range** (`Enter`) to queue several.
 - **Keep selected parts** trims the video down to them. **Remove selected parts** cuts them out and keeps the rest. Several ranges are joined in order.
 - A timeline bar shows the selection and the playhead. Click it to jump.
-- **Fast:** stream copy. Instant and lossless, but cuts snap to keyframes.
+- **Fast:** stream copy. Instant and lossless, but each part has to start on a keyframe. The tab loads the keyframe positions, marks them on the timeline, and warns you when a part will start earlier than your In point.
 - **Precise:** re-encodes to H.264/AAC for frame-exact cuts.
+- **Subtitle tracks** in the video (SRT, ASS, WebVTT, MP4 `mov_text`) are cut along with it in both modes. Each line is shifted and clipped to match the kept parts, and its language and title are kept. Image-based subtitles (DVD/Blu-ray PGS) are dropped when trimming.
 
 ### General
 
@@ -54,6 +55,7 @@ crates/
     ffmpeg.rs        FfmpegCli: engine that drives ffmpeg/ffprobe executables
     subtitles.rs     EmbedRequest + ffmpeg argument building (pure, unit-tested)
     edit.rs          TimeRange / keep_ranges / TrimRequest (trim & cut)
+    retime.rs        Shifts/clips SRT and ASS cues to match a trim
     preview.rs       PreviewRequest / Frame / FrameSource for on-screen playback
     media.rs         MediaInfo / StreamInfo from probing
     job.rs           Progress + CancelToken for long-running jobs
@@ -75,6 +77,7 @@ crates/
     - bundle FFmpeg as a native library (`.so`) and implement `Engine` over it
     - use `MediaCodec`/`MediaMuxer` through JNI
 - **Preview.** `FfmpegCli` streams scaled frames from ffmpeg as PPM images (each image carries its own size) at up to 30 fps. Subtitles go through the same libass filter as burn-in, so what you see is what you'll export. The preview has no audio yet: the plan is `cpal` playback with the audio as the master clock. For a real timeline, switch the decoder to `ffmpeg-next` so seeking is faster.
+- **Trimming without re-encoding.** Copy mode never seeks, because FFmpeg's quick-seek lands on different keyframes in different containers. One pass with the segment muxer splits the file at keyframes into pieces whose timestamps start at 0. The pieces are joined, each cut to length. Subtitles are never cut by FFmpeg: they're extracted from the untouched source and retimed in Rust (`retime.rs`). To debug a real file, run `cargo run -p cutframe-core --example trim -- IN OUT START END [precise]`.
 - **Tools.** Every feature is a `Tool` (see `tools.rs`). Trim, concat, crop and similar features slot in as new tabs until the timeline editor replaces them.
 - **Android.** The GUI is egui/eframe, which runs on Android through `android-activity`. The app code lives in a library (`lib.rs`) so a `cdylib` with `android_main` can reuse it. File pickers are behind `cfg(target_os = "android")` stubs, and they still need the Storage Access Framework.
 - **Windows.** Release builds use the GUI subsystem, so no console window appears. FFmpeg child processes start with `CREATE_NO_WINDOW`. Ship `ffmpeg.exe` and `ffprobe.exe` next to `cutframe.exe`.

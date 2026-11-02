@@ -105,16 +105,72 @@ impl Engine for FfmpegCli {
         cancel: &CancelToken,
     ) -> Result<()> {
         req.validate()?;
-        let has_audio = self.probe(&req.input)?.count(StreamKind::Audio) > 0;
-        let script = std::env::temp_dir()
-            .join(format!("cutframe-{}-{:p}.ffconcat", std::process::id(), req));
-        if req.accuracy == edit::Accuracy::Fast {
-            std::fs::write(&script, edit::concat_script(req))?;
+        let info = self.probe(&req.input)?;
+        let has_audio = info.count(StreamKind::Audio) > 0;
+        // (index among subtitle streams, codec) of the text tracks we can retime.
+        let text_subs: Vec<(usize, String)> = info
+            .streams
+            .iter()
+            .filter(|s| s.kind == StreamKind::Subtitle)
+            .enumerate()
+            .filter(|(_, s)| edit::is_text_subtitle(&s.codec))
+            .map(|(i, s)| (i, s.codec.clone()))
+            .collect();
+
+        let tmp = TempDir::new()?;
+        // Video/audio go straight to the output unless subtitles still need adding.
+        let av_out = if text_subs.is_empty() {
+            req.output.clone()
+        } else {
+            let ext = req.output.extension().map(|e| e.to_string_lossy()).unwrap_or("mkv".into());
+            tmp.0.join(format!("av.{ext}"))
+        };
+
+        let parts = match req.accuracy {
+            edit::Accuracy::Precise => {
+                let args = edit::precise_args(req, has_audio, &av_out);
+                self.run_job(&args, Some(req.output_duration()), &av_out, on_progress, cancel)?;
+                req.keep.clone()
+            }
+            edit::Accuracy::Fast => {
+                let keyframes = self.keyframes(&req.input)?;
+                let parts = edit::snap_to_keyframes(&req.keep, &keyframes);
+                self.trim_fast(req, &parts, &keyframes, &av_out, &tmp.0, on_progress, cancel)?;
+                parts
+            }
+        };
+
+        if !text_subs.is_empty() {
+            self.add_retimed_subtitles(req, &text_subs, &parts, &av_out, &tmp.0, cancel)?;
         }
-        let args = edit::ffmpeg_args(req, &script, has_audio);
-        let result = self.run_job(&args, Some(req.output_duration()), &req.output, on_progress, cancel);
-        let _ = std::fs::remove_file(&script);
-        result
+        Ok(())
+    }
+
+    fn keyframes(&self, path: &Path) -> Result<Vec<Duration>> {
+        // Packet flags come straight from the container index: no decoding.
+        let out = command(&self.ffprobe)
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-show_entries", "packet=pts_time,flags", "-of", "csv=p=0"])
+            .arg(path)
+            .output()
+            .map_err(|e| spawn_error(&self.ffprobe, e))?;
+        if !out.status.success() {
+            return Err(Error::Probe(String::from_utf8_lossy(&out.stderr).trim().to_owned()));
+        }
+        let mut keys: Vec<Duration> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let (pts, flags) = l.split_once(',')?;
+                if !flags.starts_with('K') {
+                    return None;
+                }
+                let t: f64 = pts.parse().ok()?;
+                (t.is_finite() && t >= 0.0).then(|| Duration::from_secs_f64(t))
+            })
+            .collect();
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
     }
 
     fn open_preview(&self, req: &PreviewRequest) -> Result<Box<dyn FrameSource>> {
@@ -142,6 +198,101 @@ impl Engine for FfmpegCli {
 }
 
 impl FfmpegCli {
+    /// Fast trim without re-encoding. One sequential pass (no seeking, which
+    /// is imprecise in copy mode and differs between containers) splits the
+    /// input at keyframes into pieces with clean timestamps; the pieces that
+    /// start each part are then joined, each cut to length.
+    #[allow(clippy::too_many_arguments)]
+    fn trim_fast(
+        &self,
+        req: &TrimRequest,
+        parts: &[edit::TimeRange],
+        keyframes: &[Duration],
+        output: &Path,
+        tmp: &Path,
+        on_progress: &mut dyn FnMut(Progress),
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        // Pieces use the input's container, which can always hold its streams.
+        let ext = req.input.extension().map(|e| e.to_string_lossy()).unwrap_or("mkv".into());
+        let list = tmp.join("pieces.csv");
+        let until = parts.last().map_or(Duration::ZERO, |p| p.end);
+        let args = edit::split_args(
+            &req.input,
+            until,
+            &edit::split_times(parts, keyframes),
+            &list,
+            &tmp.join(format!("piece%04d.{ext}")),
+        );
+        // Splitting is nearly all the work; joining is quick.
+        let mut split_progress = |p: Progress| {
+            let f = p.fraction().unwrap_or(0.0) as f64 * 0.95;
+            on_progress(Progress { position: until.mul_f64(f), total: Some(until), ..p })
+        };
+        self.run_job(&args, Some(until), &list, &mut split_progress, cancel)?;
+
+        let pieces = edit::parse_pieces(&std::fs::read_to_string(&list)?, tmp);
+        let chosen = edit::pick_pieces(parts, &pieces)
+            .ok_or_else(|| Error::Probe("could not split the video at its keyframes".into()))?;
+        let script = tmp.join("join.ffconcat");
+        std::fs::write(&script, edit::concat_list(&chosen))?;
+        let total: Duration = parts.iter().map(edit::TimeRange::len).sum();
+        self.run_job(&edit::concat_args(&script, output, total), None, output, &mut |_| {}, cancel)?;
+        on_progress(Progress { position: until, total: Some(until), speed: None });
+        Ok(())
+    }
+
+    /// Extract text subtitles from the untouched source, retime them to the
+    /// kept `parts`, and mux them with `av` into the request's output.
+    fn add_retimed_subtitles(
+        &self,
+        req: &TrimRequest,
+        subs: &[(usize, String)],
+        parts: &[edit::TimeRange],
+        av: &Path,
+        tmp: &Path,
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        let ass = |codec: &str| matches!(codec, "ass" | "ssa");
+        let files: Vec<PathBuf> = subs
+            .iter()
+            .map(|(i, codec)| tmp.join(format!("sub{i}.{}", if ass(codec) { "ass" } else { "srt" })))
+            .collect();
+
+        let mut extract = edit::base_args();
+        extract.push("-i".into());
+        extract.push(req.input.clone().into());
+        for ((i, _), file) in subs.iter().zip(&files) {
+            extract.push("-map".into());
+            extract.push(format!("0:s:{i}").into());
+            extract.push(file.clone().into());
+        }
+        self.run_job(&extract, None, &files[0], &mut |_| {}, cancel)?;
+
+        // Retime each; tracks with no cues left in the kept parts are dropped.
+        let mut kept = Vec::new();
+        for ((i, codec), file) in subs.iter().zip(&files) {
+            let text = std::fs::read_to_string(file)?;
+            let retimed = if ass(codec) {
+                crate::retime::retime_ass(&text, parts)
+            } else {
+                crate::retime::retime_srt(&text, parts)
+            };
+            let has_cues = if ass(codec) { retimed.contains("\nDialogue:") } else { !retimed.is_empty() };
+            if has_cues {
+                std::fs::write(file, retimed)?;
+                kept.push((*i, codec.clone(), file.clone()));
+            }
+        }
+
+        if kept.is_empty() {
+            std::fs::rename(av, &req.output).or_else(|_| std::fs::copy(av, &req.output).map(|_| ()))?;
+            return Ok(());
+        }
+        let args = edit::mux_subtitles_args(av, &kept, &req.input, &req.output);
+        self.run_job(&args, None, &req.output, &mut |_| {}, cancel)
+    }
+
     /// Run an ffmpeg job that writes `-progress pipe:1`, deleting `output` if
     /// it fails or is cancelled.
     fn run_job(
@@ -220,6 +371,27 @@ impl Drop for FfmpegFrames {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// A scratch directory removed when dropped.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new() -> Result<Self> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!("cutframe-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

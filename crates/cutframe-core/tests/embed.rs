@@ -213,3 +213,213 @@ fn cut_precise_removes_ranges_frame_accurately() {
     assert_eq!(info.count(StreamKind::Audio), 1);
     assert_eq!(info.first_video().unwrap().codec, "h264");
 }
+
+/// 40s, 30fps, keyframe every 10s: like real camera/phone footage, where
+/// fast cuts can't land anywhere they like.
+fn make_long_gop_video(path: &Path) {
+    let ok = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=40"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=40"])
+        .args(["-c:v", "libx264", "-g", "300", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+        .arg(path)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "could not create long-GOP video");
+}
+
+/// Decode timestamps of the first video stream, in file order.
+fn video_dts(path: &Path) -> Vec<f64> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=dts_time"])
+        .args(["-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect()
+}
+
+fn fast_trim_long_gop(name: &str, ext: &str, sel: &[(f64, f64)]) -> Option<PathBuf> {
+    trim_long_gop(name, ext, sel, Accuracy::Fast)
+}
+
+fn trim_long_gop(name: &str, ext: &str, sel: &[(f64, f64)], accuracy: Accuracy) -> Option<PathBuf> {
+    let dir = workdir(name)?;
+    let video = dir.join(format!("in.{ext}"));
+    make_long_gop_video(&video);
+    let keep = sel
+        .iter()
+        .map(|&(a, b)| TimeRange::new(Duration::from_secs_f64(a), Duration::from_secs_f64(b)))
+        .collect();
+    let mut req = TrimRequest::new(video, dir.join(format!("out.{ext}")), keep);
+    req.accuracy = accuracy;
+    req.preset = "ultrafast".into();
+    let mut last = None;
+    FfmpegCli::locate()
+        .trim(&req, &mut |p| last = p.fraction(), &CancelToken::new())
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(last, Some(1.0));
+    Some(req.output)
+}
+
+fn decoded_frames(path: &Path) -> usize {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-count_frames", "-select_streams", "v:0"])
+        .args(["-show_entries", "stream=nb_read_frames", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+}
+
+/// Right length, right number of frames (30fps), starts at zero, and no
+/// timestamp jumps backwards by more than a frame (joins may nudge one).
+fn assert_clean_timeline(out: &Path, expected_secs: f64) {
+    let info = FfmpegCli::locate().probe(out).unwrap();
+    assert_secs(&info, expected_secs, 0.25);
+    let frames = decoded_frames(out) as f64;
+    assert!((frames - expected_secs * 30.0).abs() <= 3.0, "{frames} frames for {expected_secs}s");
+    let dts = video_dts(out);
+    assert!(dts[0].abs() < 0.2, "video should start at ~0, starts at {}", dts[0]);
+    let worst = dts.windows(2).map(|w| w[0] - w[1]).fold(0.0, f64::max);
+    assert!(worst < 0.04, "timestamps jump back by {worst}s");
+}
+
+#[test]
+fn engine_lists_keyframes() {
+    let Some(dir) = workdir("keyframes") else { return };
+    let video = dir.join("in.mp4");
+    make_long_gop_video(&video);
+    let keys = FfmpegCli::locate().keyframes(&video).unwrap();
+    let secs: Vec<u64> = keys.iter().map(|k| k.as_secs_f64().round() as u64).collect();
+    assert_eq!(secs, vec![0, 10, 20, 30]);
+}
+
+#[test]
+fn fast_trim_mid_gop_starts_on_keyframe() {
+    // 14–22 can only start at the 10s keyframe in copy mode: 12s, clean.
+    for ext in ["mp4", "mkv"] {
+        let name = format!("fast-gop-one-{ext}");
+        let Some(out) = fast_trim_long_gop(&name, ext, &[(14.0, 22.0)]) else { return };
+        assert_clean_timeline(&out, 12.0);
+    }
+}
+
+#[test]
+fn fast_trim_several_ranges_has_monotonic_timestamps() {
+    // Regression: joining parts used to stack lead-in frames onto the
+    // previous part's timestamps and scramble the timeline.
+    for ext in ["mp4", "mkv"] {
+        let name = format!("fast-gop-multi-{ext}");
+        let Some(out) = fast_trim_long_gop(&name, ext, &[(4.0, 8.0), (24.0, 30.0)]) else { return };
+        // Snapped to 0–8 and 20–30.
+        assert_clean_timeline(&out, 18.0);
+    }
+}
+
+#[test]
+fn precise_trim_long_gop_mkv_is_exact() {
+    let sel = [(14.0, 22.0), (31.5, 33.0)];
+    let Some(out) = trim_long_gop("precise-gop-mkv", "mkv", &sel, Accuracy::Precise) else { return };
+    assert_clean_timeline(&out, 9.5);
+}
+
+/// Long-GOP video with a mov_text subtitle track (like a video subtitled by
+/// the Embed tool) whose cues sit at known times.
+fn make_subbed_long_gop_video(dir: &Path) -> PathBuf {
+    let plain = dir.join("plain.mp4");
+    make_long_gop_video(&plain);
+    let srt = dir.join("cues.srt");
+    std::fs::write(
+        &srt,
+        "1\n00:00:05,000 --> 00:00:06,000\nA\n\n2\n00:00:15,000 --> 00:00:16,000\nB\n\n\
+         3\n00:00:21,000 --> 00:00:25,000\nC\n\n4\n00:00:26,000 --> 00:00:27,000\nD\n",
+    )
+    .unwrap();
+    let out = dir.join("subbed.mp4");
+    let mut req = EmbedRequest::new(plain, srt, out.clone());
+    req.language = Some("eng".into());
+    FfmpegCli::locate().embed_subtitles(&req, &mut |_| {}, &CancelToken::new()).unwrap();
+    out
+}
+
+/// Subtitle cues of a file as (start, end, text), read back via SRT.
+fn cues(path: &Path) -> Vec<(f64, f64, String)> {
+    let srt = path.with_extension("check.srt");
+    let ok = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-i"])
+        .arg(path)
+        .args(["-map", "0:s:0"])
+        .arg(&srt)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "no subtitle track in {}", path.display());
+    let t = |s: &str| {
+        let (hms, ms) = s.trim().split_once(',').unwrap();
+        let v: Vec<f64> = hms.split(':').map(|x| x.parse().unwrap()).collect();
+        v[0] * 3600.0 + v[1] * 60.0 + v[2] + ms.parse::<f64>().unwrap() / 1000.0
+    };
+    std::fs::read_to_string(&srt)
+        .unwrap()
+        .split("\n\n")
+        .filter_map(|b| {
+            let mut l = b.lines().skip(1);
+            let (a, z) = l.next()?.split_once("-->")?;
+            Some((t(a), t(z), l.collect::<Vec<_>>().join(" ")))
+        })
+        .collect()
+}
+
+fn assert_cues(path: &Path, expected: &[(f64, f64, &str)]) {
+    let got = cues(path);
+    assert_eq!(got.len(), expected.len(), "cues: {got:?}");
+    for ((s, e, t), (xs, xe, xt)) in got.iter().zip(expected) {
+        assert!((s - xs).abs() < 0.1 && (e - xe).abs() < 0.1 && t == xt, "cues: {got:?}");
+    }
+    // The subtitle track must not outlast the video (that stretched the timeline).
+    let info = FfmpegCli::locate().probe(path).unwrap();
+    let last_end = got.last().map_or(0.0, |c| c.1);
+    assert!(last_end <= info.duration.unwrap().as_secs_f64() + 0.05);
+}
+
+fn trim_subbed(name: &str, sel: &[(f64, f64)], accuracy: Accuracy) -> Option<PathBuf> {
+    let dir = workdir(name)?;
+    let video = make_subbed_long_gop_video(&dir);
+    let keep = sel
+        .iter()
+        .map(|&(a, b)| TimeRange::new(Duration::from_secs_f64(a), Duration::from_secs_f64(b)))
+        .collect();
+    let mut req = TrimRequest::new(video, dir.join("out.mp4"), keep);
+    req.accuracy = accuracy;
+    req.preset = "ultrafast".into();
+    FfmpegCli::locate().trim(&req, &mut |_| {}, &CancelToken::new()).unwrap_or_else(|e| panic!("{e}"));
+    Some(req.output)
+}
+
+#[test]
+fn fast_trim_retimes_subtitles() {
+    // 14–22 really starts at the 10s keyframe: B at 5–6, C clipped to 11–12.
+    let Some(out) = trim_subbed("subs-fast", &[(14.0, 22.0)], Accuracy::Fast) else { return };
+    assert_clean_timeline(&out, 12.0);
+    assert_cues(&out, &[(5.0, 6.0, "B"), (11.0, 12.0, "C")]);
+    let info = FfmpegCli::locate().probe(&out).unwrap();
+    let sub = info.streams.iter().find(|s| s.kind == StreamKind::Subtitle).unwrap();
+    assert_eq!(sub.language.as_deref(), Some("eng"), "language tag carried over");
+}
+
+#[test]
+fn precise_trim_retimes_subtitles() {
+    let Some(out) = trim_subbed("subs-precise", &[(14.0, 22.0)], Accuracy::Precise) else { return };
+    assert_clean_timeline(&out, 8.0);
+    assert_cues(&out, &[(1.0, 2.0, "B"), (7.0, 8.0, "C")]);
+}
+
+#[test]
+fn precise_cut_keeps_subtitles_across_parts() {
+    // Keep 4–8 and 24–30: A → 1–2; C's tail 24–25 → 4–5; D → 6–7.
+    let sel = [(4.0, 8.0), (24.0, 30.0)];
+    let Some(out) = trim_subbed("subs-precise-multi", &sel, Accuracy::Precise) else { return };
+    assert_clean_timeline(&out, 10.0);
+    assert_cues(&out, &[(1.0, 2.0, "A"), (4.0, 5.0, "C"), (6.0, 7.0, "D")]);
+}
